@@ -166,3 +166,4 @@ jobs:
           file_pattern: "lib/generated/metadata/geocoding/86_*.dart"
           branch: main
           repository: .
+          push_options: '--force'  # 🔥 加了这一行，强制推送，专治各种冲突
