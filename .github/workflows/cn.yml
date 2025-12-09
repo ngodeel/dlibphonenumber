@@ -1,0 +1,177 @@
+name: 自动覆盖修正文件
+
+on:
+  push:
+    branches:
+      - main  # 只要 main 被自动更新了，这里就会触发
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  overwrite-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pypinyin pandas
+
+      # =========================================================
+      # 执行你的处理逻辑
+      # =========================================================
+      - name: Process and Overwrite Files
+        run: |
+          # 1. 下载 SQL 并转 CSV
+          cat > run_all.py << 'EOF'
+          import requests
+          import pandas as pd
+          import csv
+          import os
+          from collections import defaultdict
+          from pypinyin import lazy_pinyin, Style
+
+          # --- 函数定义区 ---
+
+          def download_and_convert_sql():
+              print("Downloading SQL...")
+              url = "https://github.com/dannyhu926/phone_location/raw/refs/heads/master/mysql/phone_location.sql"
+              response = requests.get(url)
+              response.raise_for_status()
+              
+              print("Converting SQL to CSV...")
+              insert_statements = [line for line in response.text.splitlines() if line.startswith("INSERT INTO `phone_location`")]
+              data = []
+              for statement in insert_statements:
+                  values_str = statement[statement.find("VALUES") + len("VALUES"):].strip()
+                  values = []
+                  in_quote = False
+                  current_value = ""
+                  for char in values_str:
+                      if char == "'":
+                          in_quote = not in_quote
+                      elif char == "," and not in_quote:
+                          values.append(current_value.strip("'"))
+                          current_value = ""
+                      elif in_quote:
+                          current_value += char
+                  values.append(current_value.strip("'"))
+                  data.append(values[1:5])
+              
+              df = pd.DataFrame(data, columns=['pref', 'phone', 'province', 'city'])
+              os.makedirs('lib/cn', exist_ok=True)
+              df.to_csv('lib/cn/phone_location.csv', index=False, quoting=csv.QUOTE_NONNUMERIC)
+
+          def preprocess_csv():
+              print("Preprocessing CSV...")
+              df = pd.read_csv('lib/cn/phone_location.csv')
+              df = df.drop(columns=['pref'])
+              df['phone'] = '86' + df['phone'].astype(str).str.replace("'", "")
+              df['province'] = df['province'].str.replace("'", "")
+              df['city'] = df['city'].str.replace("'", "")
+              # 返回 DataFrame 而不是存文件，减少 IO
+              return df
+
+          def convert_to_pinyin(province, city):
+              p = ''.join(lazy_pinyin(province, style=Style.NORMAL))
+              c = ''.join(lazy_pinyin(city, style=Style.NORMAL))
+              return f"{c.title()}, {p.title()}"
+
+          def optimize_data(df):
+              print("Optimizing Data...")
+              processed = set()
+              result = []
+              location_groups = defaultdict(list)
+              
+              for _, row in df.iterrows():
+                  phone = str(row['phone'])
+                  location_groups[f"{row['province']}{row['city']}"].append({
+                      'phone': phone, 'province': row['province'], 'city': row['city']
+                  })
+
+              # 第一轮优化：合并前缀
+              for location, numbers in location_groups.items():
+                  prefix_groups = defaultdict(list)
+                  for num in numbers:
+                      if num['phone'] not in processed:
+                          prefix = num['phone'][:-1]
+                          prefix_groups[prefix].append(num)
+                  
+                  for prefix, group in prefix_groups.items():
+                      if len(group) == 10:
+                          sorted_group = sorted(group, key=lambda x: x['phone'])
+                          if all(int(n['phone'][-1]) == i for i, n in enumerate(sorted_group)):
+                              first = sorted_group[0]
+                              result.append({'phone': int(prefix), 'province': first['province'], 'city': first['city']})
+                              processed.update(n['phone'] for n in sorted_group)
+
+              # 补全剩余号码
+              for _, row in df.iterrows():
+                  phone = str(row['phone'])
+                  if phone not in processed:
+                      result.append({'phone': int(phone), 'province': row['province'], 'city': row['city']})
+              
+              # 再次排序
+              final_df = pd.DataFrame(result)
+              final_df.sort_values(by='phone', inplace=True)
+              return final_df
+
+          def generate_dart(final_df):
+              print("Generating Dart files...")
+              optimized_zh = {}
+              optimized_en = {}
+              
+              for _, row in final_df.iterrows():
+                  phone = row['phone']
+                  optimized_zh[phone] = f"{row['province']}{row['city']}"
+                  optimized_en[phone] = convert_to_pinyin(row['province'], row['city'])
+
+              # 🔥 关键修改：直接写入 phone_location_zh.dart 和 phone_location_en.dart
+              # 这样就覆盖了原仓库的文件
+              
+              with open('lib/cn/phone_location_zh.dart', 'w', encoding='utf-8') as f:
+                  f.write('// Generated by GitHub Actions - Optimized Version\n')
+                  f.write('Map<int, String> get86_zh() {\n  return {\n')
+                  for k, v in optimized_zh.items(): f.write(f'    {k}: "{v}",\n')
+                  f.write('  };\n}\n')
+
+              with open('lib/cn/phone_location_en.dart', 'w', encoding='utf-8') as f:
+                  f.write('// Generated by GitHub Actions - Optimized Version\n')
+                  f.write('Map<int, String> get86_en() {\n  return {\n')
+                  for k, v in optimized_en.items(): f.write(f'    {k}: "{v}",\n')
+                  f.write('  };\n}\n')
+
+          # --- 主执行流程 ---
+          if __name__ == "__main__":
+              download_and_convert_sql()
+              df = preprocess_csv()
+              
+              # 为了保证逻辑一致，这里模拟你脚本里的两轮处理（虽然逻辑上可以直接用 df）
+              # 直接复用优化逻辑
+              final_df = optimize_data(df)
+              
+              # 再次运行一遍优化以确保覆盖（根据你原脚本逻辑是跑两轮，这里简化合并）
+              # 如果你需要严格的两轮 CSV IO 操作，可以保留原样，这里直接生成最终结果
+              generate_dart(final_df)
+              print("Done.")
+          EOF
+          
+          python run_all.py
+
+      # 4. 提交并覆盖
+      - name: Commit and Force Push
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-overwrite: Replace files with optimized version"
+          file_pattern: "lib/cn/phone_location_*.dart"
+          branch: main
+          repository: .
