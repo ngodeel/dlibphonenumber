@@ -1,19 +1,20 @@
-name: 自动覆盖修正文件
+name: 自动优化并合并固话 (运行在 dlib)
 
 on:
   push:
     branches:
-      - main  # 只要 main 被自动更新了，这里就会触发
+      - main  # 只要自动同步更新了代码，这里就会触发
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  overwrite-files:
+  optimize-and-merge:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout current repo
+        uses: actions/checkout@v4
         with:
           ref: main
 
@@ -23,155 +24,145 @@ jobs:
           python-version: '3.x'
 
       - name: Install dependencies
-        run: |
-          pip install requests pypinyin pandas
+        run: pip install requests pandas pypinyin
 
       # =========================================================
-      # 执行你的处理逻辑
+      # 核心脚本：下载SQL + 远程拉取固话 + 优化 + 合并 + 写入
       # =========================================================
-      - name: Process and Overwrite Files
+      - name: Process Data
         run: |
-          # 1. 下载 SQL 并转 CSV
-          cat > run_all.py << 'EOF'
+          cat > run_process.py << 'EOF'
           import requests
           import pandas as pd
-          import csv
           import os
+          import re
           from collections import defaultdict
           from pypinyin import lazy_pinyin, Style
 
-          # --- 函数定义区 ---
+          # === 配置部分 ===
+          # 1. 手机号 SQL 源
+          SQL_URL = "https://github.com/dannyhu926/phone_location/raw/refs/heads/master/mysql/phone_location.sql"
+          
+          # 2. 固话数据源 (直接从你的 vccard 仓库 raw 地址读取，不需要检出那个仓库)
+          FIXED_ZH_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_zh.dart"
+          FIXED_EN_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_en.dart"
 
-          def download_and_convert_sql():
-              print("Downloading SQL...")
-              url = "https://github.com/dannyhu926/phone_location/raw/refs/heads/master/mysql/phone_location.sql"
-              response = requests.get(url)
-              response.raise_for_status()
-              
-              print("Converting SQL to CSV...")
-              insert_statements = [line for line in response.text.splitlines() if line.startswith("INSERT INTO `phone_location`")]
-              data = []
-              for statement in insert_statements:
-                  values_str = statement[statement.find("VALUES") + len("VALUES"):].strip()
-                  values = []
-                  in_quote = False
-                  current_value = ""
-                  for char in values_str:
-                      if char == "'":
-                          in_quote = not in_quote
-                      elif char == "," and not in_quote:
-                          values.append(current_value.strip("'"))
-                          current_value = ""
-                      elif in_quote:
-                          current_value += char
-                  values.append(current_value.strip("'"))
-                  data.append(values[1:5])
-              
-              df = pd.DataFrame(data, columns=['pref', 'phone', 'province', 'city'])
-              os.makedirs('lib/cn', exist_ok=True)
-              df.to_csv('lib/cn/phone_location.csv', index=False, quoting=csv.QUOTE_NONNUMERIC)
+          # 3. 输出路径 (当前 dlib 仓库的路径)
+          OUTPUT_ZH = "lib/generated/metadata/geocoding/86_zh.dart"
+          OUTPUT_EN = "lib/generated/metadata/geocoding/86_en.dart"
 
-          def preprocess_csv():
-              print("Preprocessing CSV...")
-              df = pd.read_csv('lib/cn/phone_location.csv')
-              df = df.drop(columns=['pref'])
-              df['phone'] = '86' + df['phone'].astype(str).str.replace("'", "")
-              df['province'] = df['province'].str.replace("'", "")
-              df['city'] = df['city'].str.replace("'", "")
-              # 返回 DataFrame 而不是存文件，减少 IO
-              return df
-
+          # === 辅助函数 ===
           def convert_to_pinyin(province, city):
               p = ''.join(lazy_pinyin(province, style=Style.NORMAL))
               c = ''.join(lazy_pinyin(city, style=Style.NORMAL))
               return f"{c.title()}, {p.title()}"
 
-          def optimize_data(df):
-              print("Optimizing Data...")
-              processed = set()
-              result = []
+          def fetch_remote_content(url):
+              """下载远程 Dart 文件内容并提取 Map"""
+              print(f"Fetching {url}...")
+              try:
+                  resp = requests.get(url)
+                  resp.raise_for_status()
+                  content = resp.text
+                  # 提取 return { ... }; 中间的内容
+                  match = re.search(r'return\s*\{([\s\S]*?)\};', content)
+                  if match:
+                      return match.group(1).strip()
+                  else:
+                      print(f"Warning: Could not parse map content from {url}")
+                      return ""
+              except Exception as e:
+                  print(f"Error fetching {url}: {e}")
+                  return ""
+
+          def main():
+              # --- 第一步：处理手机号 (SQL -> 优化) ---
+              print("1. Downloading SQL Source...")
+              response = requests.get(SQL_URL)
+              response.raise_for_status()
+              
+              print("2. Parsing SQL...")
+              insert_statements = [line for line in response.text.splitlines() if line.startswith("INSERT INTO `phone_location`")]
+              data = []
+              for statement in insert_statements:
+                  values_part = statement[statement.find("VALUES") + 6:].strip().strip(";")
+                  rows = values_part.split("),(")
+                  for row in rows:
+                      row = row.replace("(", "").replace(")", "")
+                      parts = [p.strip().strip("'") for p in row.split(",")]
+                      if len(parts) >= 4:
+                          data.append({'phone': parts[1], 'province': parts[2], 'city': parts[3]})
+              
+              df = pd.DataFrame(data)
+              df['phone'] = '86' + df['phone'].astype(str)
+              
+              print("3. Optimizing Mobile Data (10-to-1 Grouping)...")
+              result_list = []
               location_groups = defaultdict(list)
               
               for _, row in df.iterrows():
-                  phone = str(row['phone'])
-                  location_groups[f"{row['province']}{row['city']}"].append({
-                      'phone': phone, 'province': row['province'], 'city': row['city']
-                  })
-
-              # 第一轮优化：合并前缀
-              for location, numbers in location_groups.items():
-                  prefix_groups = defaultdict(list)
-                  for num in numbers:
-                      if num['phone'] not in processed:
-                          prefix = num['phone'][:-1]
-                          prefix_groups[prefix].append(num)
+                  location_groups[f"{row['province']}|{row['city']}"].append(row)
+              
+              for key, rows in location_groups.items():
+                  prefix_map = defaultdict(list)
+                  for r in rows:
+                      prefix_map[r['phone'][:-1]].append(r)
                   
-                  for prefix, group in prefix_groups.items():
+                  for prefix, group in prefix_map.items():
                       if len(group) == 10:
-                          sorted_group = sorted(group, key=lambda x: x['phone'])
-                          if all(int(n['phone'][-1]) == i for i, n in enumerate(sorted_group)):
-                              first = sorted_group[0]
-                              result.append({'phone': int(prefix), 'province': first['province'], 'city': first['city']})
-                              processed.update(n['phone'] for n in sorted_group)
-
-              # 补全剩余号码
-              for _, row in df.iterrows():
-                  phone = str(row['phone'])
-                  if phone not in processed:
-                      result.append({'phone': int(phone), 'province': row['province'], 'city': row['city']})
+                          # 优化：10个连续号码合并为1个前缀
+                          first = group[0]
+                          result_list.append({'phone': int(prefix), 'province': first['province'], 'city': first['city']})
+                      else:
+                          # 保持原样
+                          for item in group:
+                              result_list.append({'phone': int(item['phone']), 'province': item['province'], 'city': item['city']})
               
-              # 再次排序
-              final_df = pd.DataFrame(result)
+              final_df = pd.DataFrame(result_list)
               final_df.sort_values(by='phone', inplace=True)
-              return final_df
+              print(f"Mobile optimization done. {len(final_df)} rules generated.")
 
-          def generate_dart(final_df):
-              print("Generating Dart files...")
-              optimized_zh = {}
-              optimized_en = {}
-              
-              for _, row in final_df.iterrows():
-                  phone = row['phone']
-                  optimized_zh[phone] = f"{row['province']}{row['city']}"
-                  optimized_en[phone] = convert_to_pinyin(row['province'], row['city'])
+              # --- 第二步：获取固话数据 ---
+              print("4. Fetching Fixed Line Data from vccard...")
+              fixed_zh_data = fetch_remote_content(FIXED_ZH_URL)
+              fixed_en_data = fetch_remote_content(FIXED_EN_URL)
 
-              # 🔥 关键修改：直接写入 phone_location_zh.dart 和 phone_location_en.dart
-              # 这样就覆盖了原仓库的文件
+              # --- 第三步：合并并写入 ---
+              print("5. Writing Final Files...")
+              os.makedirs(os.path.dirname(OUTPUT_ZH), exist_ok=True)
               
-              with open('lib/cn/phone_location_zh.dart', 'w', encoding='utf-8') as f:
-                  f.write('// Generated by GitHub Actions - Optimized Version\n')
+              # 写入中文版
+              with open(OUTPUT_ZH, 'w', encoding='utf-8') as f:
+                  f.write('// Generated by GitHub Actions (Merged Fixed + Optimized Mobile)\n')
                   f.write('Map<int, String> get86_zh() {\n  return {\n')
-                  for k, v in optimized_zh.items(): f.write(f'    {k}: "{v}",\n')
+                  if fixed_zh_data: f.write(fixed_zh_data + ",\n") # 固话在前
+                  for _, row in final_df.iterrows():
+                      f.write(f'    {row["phone"]}: "{row["province"]}{row["city"]}",\n')
                   f.write('  };\n}\n')
 
-              with open('lib/cn/phone_location_en.dart', 'w', encoding='utf-8') as f:
-                  f.write('// Generated by GitHub Actions - Optimized Version\n')
+              # 写入英文版
+              with open(OUTPUT_EN, 'w', encoding='utf-8') as f:
+                  f.write('// Generated by GitHub Actions (Merged Fixed + Optimized Mobile)\n')
                   f.write('Map<int, String> get86_en() {\n  return {\n')
-                  for k, v in optimized_en.items(): f.write(f'    {k}: "{v}",\n')
+                  if fixed_en_data: f.write(fixed_en_data + ",\n") # 固话在前
+                  for _, row in final_df.iterrows():
+                      pinyin = convert_to_pinyin(row['province'], row['city'])
+                      f.write(f'    {row["phone"]}: "{pinyin}",\n')
                   f.write('  };\n}\n')
-
-          # --- 主执行流程 ---
-          if __name__ == "__main__":
-              download_and_convert_sql()
-              df = preprocess_csv()
-              
-              # 为了保证逻辑一致，这里模拟你脚本里的两轮处理（虽然逻辑上可以直接用 df）
-              # 直接复用优化逻辑
-              final_df = optimize_data(df)
-              
-              # 再次运行一遍优化以确保覆盖（根据你原脚本逻辑是跑两轮，这里简化合并）
-              # 如果你需要严格的两轮 CSV IO 操作，可以保留原样，这里直接生成最终结果
-              generate_dart(final_df)
+                  
               print("Done.")
+
+          if __name__ == "__main__":
+              main()
           EOF
           
-          python run_all.py
+          python run_process.py
 
-      # 4. 提交并覆盖
+      # 4. 提交并覆盖当前仓库
       - name: Commit and Force Push
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Auto-overwrite: Replace files with optimized version"
-          file_pattern: "lib/cn/phone_location_*.dart"
+          commit_message: "chore(data): Auto optimize and merge fixed line data"
+          file_pattern: "lib/generated/metadata/geocoding/86_*.dart"
           branch: main
           repository: .
