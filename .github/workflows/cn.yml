@@ -3,7 +3,7 @@ name: 自动优化并合并固话 (运行在 dlib)
 on:
   push:
     branches:
-      - main  # 只要自动同步更新了代码，这里就会触发
+      - main
   workflow_dispatch:
 
 permissions:
@@ -27,7 +27,7 @@ jobs:
         run: pip install requests pandas pypinyin
 
       # =========================================================
-      # 核心脚本：下载SQL + 远程拉取固话 + 优化 + 合并 + 写入
+      # 核心脚本：逻辑已优化（自动缩进 + 去除末尾逗号）
       # =========================================================
       - name: Process Data
         run: |
@@ -40,14 +40,10 @@ jobs:
           from pypinyin import lazy_pinyin, Style
 
           # === 配置部分 ===
-          # 1. 手机号 SQL 源
           SQL_URL = "https://github.com/dannyhu926/phone_location/raw/refs/heads/master/mysql/phone_location.sql"
-          
-          # 2. 固话数据源 (直接从你的 vccard 仓库 raw 地址读取，不需要检出那个仓库)
           FIXED_ZH_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_zh.dart"
           FIXED_EN_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_en.dart"
 
-          # 3. 输出路径 (当前 dlib 仓库的路径)
           OUTPUT_ZH = "lib/generated/metadata/geocoding/86_zh.dart"
           OUTPUT_EN = "lib/generated/metadata/geocoding/86_en.dart"
 
@@ -57,8 +53,11 @@ jobs:
               c = ''.join(lazy_pinyin(city, style=Style.NORMAL))
               return f"{c.title()}, {p.title()}"
 
-          def fetch_remote_content(url):
-              """下载远程 Dart 文件内容并提取 Map"""
+          def fetch_remote_lines(url):
+              """
+              下载远程文件，提取Map内容，并将其标准化为列表
+              返回: ['8610: "内容"', '8620: "内容"'] (无缩进，无逗号)
+              """
               print(f"Fetching {url}...")
               try:
                   resp = requests.get(url)
@@ -67,13 +66,23 @@ jobs:
                   # 提取 return { ... }; 中间的内容
                   match = re.search(r'return\s*\{([\s\S]*?)\};', content)
                   if match:
-                      return match.group(1).strip()
+                      raw_body = match.group(1).strip()
+                      # 按行分割，清理空白和末尾逗号
+                      lines = []
+                      for line in raw_body.split('\n'):
+                          clean_line = line.strip()
+                          if clean_line:
+                              # 去除末尾可能存在的逗号，方便后续统一拼接
+                              if clean_line.endswith(','):
+                                  clean_line = clean_line[:-1]
+                              lines.append(clean_line)
+                      return lines
                   else:
                       print(f"Warning: Could not parse map content from {url}")
-                      return ""
+                      return []
               except Exception as e:
                   print(f"Error fetching {url}: {e}")
-                  return ""
+                  return []
 
           def main():
               # --- 第一步：处理手机号 (SQL -> 优化) ---
@@ -110,11 +119,9 @@ jobs:
                   
                   for prefix, group in prefix_map.items():
                       if len(group) == 10:
-                          # 优化：10个连续号码合并为1个前缀
                           first = group[0]
                           result_list.append({'phone': int(prefix), 'province': first['province'], 'city': first['city']})
                       else:
-                          # 保持原样
                           for item in group:
                               result_list.append({'phone': int(item['phone']), 'province': item['province'], 'city': item['city']})
               
@@ -122,33 +129,50 @@ jobs:
               final_df.sort_values(by='phone', inplace=True)
               print(f"Mobile optimization done. {len(final_df)} rules generated.")
 
-              # --- 第二步：获取固话数据 ---
+              # --- 第二步：获取固话数据 (作为列表) ---
               print("4. Fetching Fixed Line Data from vccard...")
-              fixed_zh_data = fetch_remote_content(FIXED_ZH_URL)
-              fixed_en_data = fetch_remote_content(FIXED_EN_URL)
+              fixed_zh_lines = fetch_remote_lines(FIXED_ZH_URL)
+              fixed_en_lines = fetch_remote_lines(FIXED_EN_URL)
 
               # --- 第三步：合并并写入 ---
               print("5. Writing Final Files...")
               os.makedirs(os.path.dirname(OUTPUT_ZH), exist_ok=True)
+
+              # === 写入中文版 ===
+              all_zh_lines = []
               
-              # 写入中文版
+              # 1. 添加固话 (加缩进)
+              for line in fixed_zh_lines:
+                  all_zh_lines.append(f"    {line}") 
+                  
+              # 2. 添加手机 (加缩进)
+              for _, row in final_df.iterrows():
+                  all_zh_lines.append(f'    {row["phone"]}: "{row["province"]}{row["city"]}"')
+
               with open(OUTPUT_ZH, 'w', encoding='utf-8') as f:
                   f.write('// Generated by GitHub Actions (Merged Fixed + Optimized Mobile)\n')
                   f.write('Map<int, String> get86_zh() {\n  return {\n')
-                  if fixed_zh_data: f.write(fixed_zh_data + ",\n") # 固话在前
-                  for _, row in final_df.iterrows():
-                      f.write(f'    {row["phone"]}: "{row["province"]}{row["city"]}",\n')
-                  f.write('  };\n}\n')
+                  # 使用 join 拼接，中间加逗号换行，最后一行自然没有逗号
+                  f.write(",\n".join(all_zh_lines))
+                  f.write('\n  };\n}\n')
 
-              # 写入英文版
+              # === 写入英文版 ===
+              all_en_lines = []
+              
+              # 1. 添加固话
+              for line in fixed_en_lines:
+                  all_en_lines.append(f"    {line}")
+              
+              # 2. 添加手机
+              for _, row in final_df.iterrows():
+                  pinyin = convert_to_pinyin(row['province'], row['city'])
+                  all_en_lines.append(f'    {row["phone"]}: "{pinyin}"')
+
               with open(OUTPUT_EN, 'w', encoding='utf-8') as f:
                   f.write('// Generated by GitHub Actions (Merged Fixed + Optimized Mobile)\n')
                   f.write('Map<int, String> get86_en() {\n  return {\n')
-                  if fixed_en_data: f.write(fixed_en_data + ",\n") # 固话在前
-                  for _, row in final_df.iterrows():
-                      pinyin = convert_to_pinyin(row['province'], row['city'])
-                      f.write(f'    {row["phone"]}: "{pinyin}",\n')
-                  f.write('  };\n}\n')
+                  f.write(",\n".join(all_en_lines))
+                  f.write('\n  };\n}\n')
                   
               print("Done.")
 
@@ -158,7 +182,6 @@ jobs:
           
           python run_process.py
 
-      # 4. 提交并覆盖当前仓库
       - name: Commit and Force Push
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
@@ -166,4 +189,4 @@ jobs:
           file_pattern: "lib/generated/metadata/geocoding/86_*.dart"
           branch: main
           repository: .
-          push_options: '--force'  # 🔥 加了这一行，强制推送，专治各种冲突
+          push_options: '--force'
