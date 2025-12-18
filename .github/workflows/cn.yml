@@ -29,9 +29,8 @@ jobs:
           pip install requests pypinyin pandas
 
       # ---------------------------------------------------------
-      # 第一部分：数据处理流程
-      # (下载SQL -> CSV -> 预处理 -> 优化生成手机号Dart)
-      # 这些步骤会在 Runner 本地生成 lib/cn/ 下的中间文件，但我们最后不会提交它们
+      # 第一部分：生成手机号数据 (本地临时文件，不提交)
+      # 循环优化直到无法继续合并
       # ---------------------------------------------------------
       
       - name: Download SQL and Convert to CSV
@@ -92,80 +91,101 @@ jobs:
           EOF
           python preprocess_csv.py
 
-      - name: Optimize Phone Ranges and Generate Mobile Dart
+      - name: Optimize Phone Ranges (Loop until stable)
         run: |
           cat > optimize_ranges.py << 'EOF'
           import pandas as pd
           from collections import defaultdict
           from pypinyin import lazy_pinyin, Style
           import os
+          import sys
 
           def convert_to_pinyin(province, city):
               p = ''.join(lazy_pinyin(province, style=Style.NORMAL))
               c = ''.join(lazy_pinyin(city, style=Style.NORMAL))
               return f"{c.title()}, {p.title()}"
 
-          def process_csv(input_file):
-              df = pd.read_csv(input_file)
+          # 核心优化逻辑：输入列表，输出优化后的列表
+          def process_data_list(data_list):
               processed = set()
               result = []
-
+              
+              # 1. 按“省份+城市”分组
               location_groups = defaultdict(list)
-              for _, row in df.iterrows():
-                  phone = str(row['phone'])
-                  location_groups[f"{row['province']}{row['city']}"].append({
-                      'phone': phone,
-                      'province': row['province'],
-                      'city': row['city']
-                  })
+              for item in data_list:
+                  key = f"{item['province']}{item['city']}"
+                  location_groups[key].append(item)
 
+              # 2. 在每个地理分组内，寻找可以合并的号段
               for location, numbers in location_groups.items():
                   prefix_groups = defaultdict(list)
+                  
+                  # 按前缀分组 (例如 861380001 -> 86138000)
                   for num in numbers:
-                      if num['phone'] not in processed:
-                          prefix = num['phone'][:-1]
+                      phone_str = str(num['phone'])
+                      if phone_str not in processed:
+                          prefix = phone_str[:-1]
                           prefix_groups[prefix].append(num)
 
+                  # 检查是否有完整的 0-9
                   for prefix, group in prefix_groups.items():
                       if len(group) == 10:
-                          sorted_group = sorted(group, key=lambda x: x['phone'])
-                          if all(int(n['phone'][-1]) == i for i, n in enumerate(sorted_group)):
+                          # 确保是 0-9 结尾
+                          sorted_group = sorted(group, key=lambda x: str(x['phone']))
+                          if all(str(n['phone'])[-1] == str(i) for i, n in enumerate(sorted_group)):
                               first = sorted_group[0]
+                              # 再次确认省市一致 (虽然大分组已经保证了，但双重保险)
                               if all(n['province'] == first['province'] and n['city'] == first['city'] for n in sorted_group):
+                                  # 合并成功：添加前缀作为新号码
                                   result.append({
-                                      'phone': int(prefix),
+                                      'phone': int(prefix), # 缩短了一位的号码
                                       'province': first['province'],
                                       'city': first['city']
                                   })
-                                  processed.update(n['phone'] for n in sorted_group)
+                                  # 标记这些号码已处理
+                                  processed.update(str(n['phone']) for n in sorted_group)
 
-              for _, row in df.iterrows():
-                  phone = str(row['phone'])
-                  if phone not in processed:
-                      result.append({
-                          'phone': int(phone),
-                          'province': row['province'],
-                          'city': row['city']
-                      })
+              # 3. 将未合并的号码原样放回结果
+              for item in data_list:
+                  if str(item['phone']) not in processed:
+                      result.append(item)
+              
               return result
 
-          def optimize_phone_ranges(input_file):
-              first_round = process_csv(input_file)
-              temp_df = pd.DataFrame(first_round)
-              temp_csv = 'lib/cn/temp_processed.csv'
-              temp_df.to_csv(temp_csv, index=False)
-              second_round = process_csv(temp_csv)
+          def optimize_loop(input_file):
+              # 读取初始数据
+              df = pd.read_csv(input_file)
+              current_data = df.to_dict('records')
               
-              final_df = pd.DataFrame(second_round)
+              round_num = 1
+              while True:
+                  initial_count = len(current_data)
+                  print(f"::notice::Starting Round {round_num} optimization...")
+                  
+                  new_data = process_data_list(current_data)
+                  final_count = len(new_data)
+                  
+                  print(f"Round {round_num}: {initial_count} -> {final_count} records")
+                  
+                  if final_count == initial_count:
+                      print(f"::notice::Optimization finished at Round {round_num}. No more merges possible.")
+                      break
+                  
+                  current_data = new_data
+                  round_num += 1
+              
+              # 循环结束，准备导出
+              final_df = pd.DataFrame(current_data)
               final_df.sort_values(by='phone', inplace=True)
               
               optimized_zh = {}
               optimized_en = {}
 
               for _, row in final_df.iterrows():
-                  phone = row['phone']
+                  phone = int(row['phone'])
                   optimized_zh[phone] = f"{row['province']}{row['city']}"
                   optimized_en[phone] = convert_to_pinyin(row['province'], row['city'])
+                  
               return optimized_zh, optimized_en
 
           def generate_optimized_dart_files(optimized_zh, optimized_en):
@@ -185,15 +205,13 @@ jobs:
                   f.write('  };\n}\n')
 
           if __name__ == "__main__":
-              optimized_zh, optimized_en = optimize_phone_ranges('lib/cn/phone_location_processed.csv')
+              optimized_zh, optimized_en = optimize_loop('lib/cn/phone_location_processed.csv')
               generate_optimized_dart_files(optimized_zh, optimized_en)
           EOF
           python optimize_ranges.py
 
       # ---------------------------------------------------------
       # 第二部分：合并数据
-      # 将仓库自带的固话数据 (lib/merged/) 和刚生成的手机数据 (lib/cn/) 
-      # 合并写入到 lib/generated/metadata/geocoding/
       # ---------------------------------------------------------
 
       - name: Create final directory
@@ -203,24 +221,15 @@ jobs:
         run: |
           python << EOF
           import os
+          import requests
 
-          def extract_map_content(file_path):
-              if not os.path.exists(file_path):
-                  print(f"Warning: File not found: {file_path}")
-                  return ""
-              
-              with open(file_path, 'r', encoding='utf-8') as f:
-                  content = f.read()
-
-              # Find the start of the map data after "return {"
+          def extract_map_from_text(content):
               start_marker = "return {"
               start_index = content.find(start_marker)
               if start_index == -1: 
                   return ""
               
               start_index += len(start_marker)
-              
-              # Find the matching closing brace for the map
               brace_count = 1
               end_index = start_index
               while brace_count > 0 and end_index < len(content):
@@ -232,40 +241,50 @@ jobs:
 
               return content[start_index:end_index-1].strip()
 
-          # 固定电话数据 (仓库已有)
-          fixed_line_en_path = "lib/merged/fixed_line_en.dart" 
-          fixed_line_zh_path = "lib/merged/fixed_line_zh.dart"
+          def get_content_from_url(url):
+              print(f"Downloading: {url}")
+              r = requests.get(url)
+              r.raise_for_status()
+              return extract_map_from_text(r.text)
+
+          def get_content_from_file(path):
+              print(f"Reading local file: {path}")
+              if not os.path.exists(path):
+                  print(f"Warning: File not found: {path}")
+                  return ""
+              with open(path, 'r', encoding='utf-8') as f:
+                  return extract_map_from_text(f.read())
+
+          # 配置路径 (已修正)
+          fixed_url_en = "https://raw.githubusercontent.com/haygcao/vccard/refs/heads/dartnumber/lib/merged/fixed_line_en.dart"
+          fixed_url_zh = "https://raw.githubusercontent.com/haygcao/vccard/refs/heads/dartnumber/lib/merged/fixed_line_zh.dart"
+
+          mobile_path_en = "lib/cn/phone_location_en_optimized.dart"
+          mobile_path_zh = "lib/cn/phone_location_zh_optimized.dart"
           
-          # 手机数据 (脚本生成，不提交)
-          mobile_en_path = "lib/cn/phone_location_en_optimized.dart"
-          mobile_zh_path = "lib/cn/phone_location_zh_optimized.dart"
-          
-          # 输出目录 (最终提交)
           output_dir = "lib/generated/metadata/geocoding"
 
-          # 1. 处理英文数据
-          fixed_en = extract_map_content(fixed_line_en_path)
-          mobile_en = extract_map_content(mobile_en_path)
+          # 合并英文
+          fixed_en_data = get_content_from_url(fixed_url_en)
+          mobile_en_data = get_content_from_file(mobile_path_en)
           
           with open(f"{output_dir}/86_en.dart", "w", encoding="utf-8") as f:
               f.write("// Generated and Merged by GitHub Actions\n")
-              f.write("Map<int, String> get86_en() {{\n  return {{\n    // Fixed Line\n    {0},\n    // Mobile\n    {1}\n  }};\n}}".format(fixed_en, mobile_en))
+              f.write("Map<int, String> get86_en() {{\n  return {{\n    // Fixed Line\n    {0},\n    // Mobile\n    {1}\n  }};\n}}".format(fixed_en_data, mobile_en_data))
 
-          # 2. 处理中文数据
-          fixed_zh = extract_map_content(fixed_line_zh_path)
-          mobile_zh = extract_map_content(mobile_zh_path)
+          # 合并中文
+          fixed_zh_data = get_content_from_url(fixed_url_zh)
+          mobile_zh_data = get_content_from_file(mobile_path_zh)
 
           with open(f"{output_dir}/86_zh.dart", "w", encoding="utf-8") as f:
               f.write("// Generated and Merged by GitHub Actions\n")
-              f.write("Map<int, String> get86_zh() {{\n  return {{\n    // Fixed Line\n    {0},\n    // Mobile\n    {1}\n  }};\n}}".format(fixed_zh, mobile_zh))
+              f.write("Map<int, String> get86_zh() {{\n  return {{\n    // Fixed Line\n    {0},\n    // Mobile\n    {1}\n  }};\n}}".format(fixed_zh_data, mobile_zh_data))
           
           print(f"Merge completed. Output saved to {output_dir}")
           EOF
 
       # ---------------------------------------------------------
-      # 第三部分：提交最终结果
-      # 只提交 lib/generated/metadata/geocoding/ 下的文件
-      # 忽略 lib/cn/ 下的 CSV 和中间 Dart 文件
+      # 第三部分：提交结果
       # ---------------------------------------------------------
 
       - name: Commit and Push
