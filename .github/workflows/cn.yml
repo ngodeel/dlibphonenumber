@@ -27,7 +27,7 @@ jobs:
         run: pip install requests pandas pypinyin
 
       # =========================================================
-      # 核心脚本：复刻 Stage 4 逻辑 (2轮) + 合并固话 + 修复格式
+      # 核心脚本：严格复刻 Stage 4 逻辑 (2轮优化) + 修复格式
       # =========================================================
       - name: Process Data
         run: |
@@ -74,7 +74,7 @@ jobs:
                   print(f"Error fetching {url}: {e}")
                   return []
 
-          # === 3. 核心算法 (1:1 复刻 Stage 4 process_csv) ===
+          # === 3. 核心算法 (完全照搬你的 Stage 4 process_csv) ===
           def process_csv_logic(df):
               processed = set()
               result = []
@@ -127,7 +127,7 @@ jobs:
               return result
 
           def main():
-              # --- Step 1: 解析 SQL ---
+              # --- Step 1: 解析 SQL (对应你的 convert_sql_to_csv) ---
               print("1. Parsing SQL...")
               response = requests.get(SQL_URL)
               response.raise_for_status()
@@ -141,6 +141,7 @@ jobs:
                       row = row.replace("(", "").replace(")", "")
                       parts = [p.strip().strip("'") for p in row.split(",")]
                       if len(parts) >= 4:
+                          # 对应你的 preprocess_csv: 加上 86 前缀
                           raw_data.append({
                               'phone': '86' + parts[1], 
                               'province': parts[2], 
@@ -150,7 +151,7 @@ jobs:
               current_df = pd.DataFrame(raw_data)
               print(f"   Initial count: {len(current_df)}")
 
-              # --- Step 2: 执行两轮优化 (复刻 Stage 4 的 Round 1 & 2) ---
+              # --- Step 2: 执行两轮优化 (完全对应你的 optimize_phone_ranges) ---
               
               # Round 1 (9位 -> 8位)
               print("2. Running Optimization Round 1...")
@@ -163,15 +164,25 @@ jobs:
               round2_list = process_csv_logic(round1_df)
               
               # 排序
-              final_data = sorted(round2_list, key=lambda x: x['phone'])
-              print(f"   Final optimized count: {len(final_data)}")
+              final_df = pd.DataFrame(round2_list)
+              final_df.sort_values(by='phone', inplace=True)
+              print(f"   Final optimized count: {len(final_df)}")
 
-              # --- Step 3: 获取固话 ---
+              # --- Step 3: 生成字典 (对应你的 optimized_zh = {} 逻辑，确保无重复Key) ---
+              optimized_zh = {}
+              optimized_en = {}
+              for _, row in final_df.iterrows():
+                  phone = row['phone']
+                  # 这里绝对只存地名，不存手机号
+                  optimized_zh[phone] = f"{row['province']}{row['city']}"
+                  optimized_en[phone] = convert_to_pinyin(row['province'], row['city'])
+
+              # --- Step 4: 获取固话 ---
               print("4. Fetching Fixed Line Data...")
               fixed_zh_lines = fetch_remote_lines(FIXED_ZH_URL)
               fixed_en_lines = fetch_remote_lines(FIXED_EN_URL)
 
-              # --- Step 4: 写入文件 (格式修正：Key: "Value",) ---
+              # --- Step 5: 写入文件 (修正格式 Key: "Value",) ---
               print("5. Writing Final Files...")
               os.makedirs(os.path.dirname(OUTPUT_ZH), exist_ok=True)
 
@@ -184,9 +195,9 @@ jobs:
                   for line in fixed_zh_lines:
                       f.write(f"    {line},\n")
                   
-                  # 写入手机 (Value 不含手机号，Key 不重复)
-                  for row in final_data:
-                      f.write(f'    {row["phone"]}: "{row["province"]}{row["city"]}",\n')
+                  # 写入手机 (遍历字典，确保 Key 唯一，格式正确)
+                  for phone, location in optimized_zh.items():
+                      f.write(f'    {phone}: "{location}",\n')
                       
                   f.write('  };\n}\n')
 
@@ -200,9 +211,8 @@ jobs:
                       f.write(f"    {line},\n")
                   
                   # 写入手机
-                  for row in final_data:
-                      pinyin = convert_to_pinyin(row['province'], row['city'])
-                      f.write(f'    {row["phone"]}: "{pinyin}",\n')
+                  for phone, location in optimized_en.items():
+                      f.write(f'    {phone}: "{location}",\n')
                       
                   f.write('  };\n}\n')
                   
@@ -222,4 +232,4 @@ jobs:
           branch: main
           repository: .
           push_options: '--force'
-          token: ${{ secrets.YOUR_GITHUB_TOKEN }} # 你要求的 Token 在这里！
+          token: ${{ secrets.YOUR_GITHUB_TOKEN }} # 加上了 Token
