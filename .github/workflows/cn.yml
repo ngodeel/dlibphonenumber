@@ -1,154 +1,224 @@
-name: 优化0-9 末尾 循环压缩版
+name: 生成最终版归属地数据 (两轮极致优化+固话)
 
 on:
   workflow_dispatch:
   schedule:
-     - cron: '0 12 1 * *'
-  
+    - cron: '0 12 1 * *' # 每月1号运行一次
+
 permissions:
   contents: write
 
 jobs:
-  convert-and-optimize:
+  generate-final-data:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
-          ref: dartnumber
+          ref: main  # 确保这里是你想要推送的分支
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
 
-      - name: Install dependencies
-        run: pip install requests pypinyin pandas
-
-      - name: Process Phone Location Data
+      - name: Install Dependencies
         run: |
-          cat > run_all.py << 'EOF'
+          python -m pip install --upgrade pip
+          pip install requests pandas pypinyin
+
+      - name: Run Optimization and Generation Script
+        run: |
+          cat > generate_final.py << 'EOF'
           import requests
           import pandas as pd
+          import os
+          import re
           from collections import defaultdict
           from pypinyin import lazy_pinyin, Style
-          import os
 
-          # === 1. 下载与解析 (沿用你认可的逻辑) ===
-          def get_raw_data():
-              url = "https://github.com/dannyhu926/phone_location/raw/refs/heads/master/mysql/phone_location.sql"
-              resp = requests.get(url)
-              resp.raise_for_status()
-              sql_content = resp.text
+          # ================= 配置区域 =================
+          SQL_URL = "https://github.com/dannyhu926/phone_location/raw/refs/heads/master/mysql/phone_location.sql"
+          FIXED_ZH_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_zh.dart"
+          FIXED_EN_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_en.dart"
 
-              insert_statements = [line for line in sql_content.splitlines() if line.startswith("INSERT INTO `phone_location`")]
-              data = []
+          # 输出路径 (根据你的项目结构调整，这里设为 dlib 标准路径)
+          OUTPUT_ZH = "lib/generated/metadata/geocoding/86_zh.dart"
+          OUTPUT_EN = "lib/generated/metadata/geocoding/86_en.dart"
+          # ===========================================
+
+          def convert_to_pinyin(province, city):
+              p = ''.join(lazy_pinyin(province if province else "", style=Style.NORMAL))
+              c = ''.join(lazy_pinyin(city if city else "", style=Style.NORMAL))
+              if not city: return p.title()
+              return f"{c.title()}, {p.title()}"
+
+          def fetch_fixed_lines(url):
+              """下载固话数据并清洗格式"""
+              print(f"Fetching fixed lines from {url}...")
+              try:
+                  resp = requests.get(url)
+                  resp.raise_for_status()
+                  match = re.search(r'return\s*\{([\s\S]*?)\};', resp.text)
+                  lines = []
+                  if match:
+                      for line in match.group(1).split('\n'):
+                          clean = line.strip()
+                          if clean:
+                              if clean.endswith(','): clean = clean[:-1]
+                              lines.append(clean)
+                  return lines
+              except Exception as e:
+                  print(f"Error fetching fixed lines: {e}")
+                  return []
+
+          def process_optimization_round(df):
+              """
+              核心优化逻辑：最长前缀匹配 (Longest Prefix Match)
+              逻辑来源：用户提供的严密算法 (Location Group -> Prefix Group -> Merge 10)
+              """
+              processed_phones = set()
+              result = []
+
+              # 1. 按 (省+市) 分组
+              location_groups = defaultdict(list)
+              for _, row in df.iterrows():
+                  # 确保 phone 是字符串以便切片
+                  phone_str = str(row['phone'])
+                  key = f"{row['province']}|{row['city']}"
+                  location_groups[key].append({
+                      'phone': phone_str,
+                      'province': row['province'],
+                      'city': row['city']
+                  })
+
+              # 2. 组内按前缀合并
+              for key, items in location_groups.items():
+                  prefix_groups = defaultdict(list)
+                  for item in items:
+                      if item['phone'] not in processed_phones:
+                          parent_prefix = item['phone'][:-1] # 取父级前缀
+                          prefix_groups[parent_prefix].append(item)
+
+                  for prefix, group in prefix_groups.items():
+                      # 核心判断：是否凑齐了 0-9 (10个)
+                      if len(group) == 10:
+                          # 再次确认这10个确实是连续的 0-9 (虽然 group逻辑已保证，但双重保险)
+                          sorted_group = sorted(group, key=lambda x: x['phone'])
+                          if all(int(n['phone'][-1]) == i for i, n in enumerate(sorted_group)):
+                              # 合并！使用父级前缀
+                              first = sorted_group[0]
+                              result.append({
+                                  'phone': prefix, # 变短了
+                                  'province': first['province'],
+                                  'city': first['city']
+                              })
+                              # 标记这10个长号码已处理
+                              for n in sorted_group:
+                                  processed_phones.add(n['phone'])
+                      
+                  # 处理完合并后，剩下的就是没法合并的散户，稍后统一处理
+
+              # 3. 将所有未被合并处理的号码原样加入结果
+              for _, row in df.iterrows():
+                  phone_str = str(row['phone'])
+                  if phone_str not in processed_phones:
+                      result.append({
+                          'phone': phone_str,
+                          'province': row['province'],
+                          'city': row['city']
+                      })
+              
+              return result
+
+          def main():
+              # --- Step 1: 下载并解析 SQL ---
+              print("1. Downloading SQL...")
+              response = requests.get(SQL_URL)
+              response.raise_for_status()
+              
+              print("2. Parsing SQL to raw data...")
+              insert_statements = [line for line in response.text.splitlines() if line.startswith("INSERT INTO `phone_location`")]
+              raw_data = []
               for statement in insert_statements:
-                  values_str = statement[statement.find("VALUES") + len("VALUES"):].strip().strip(";")
-                  # 使用你代码中的思路解析 SQL
-                  rows = values_str.split("),(")
+                  values_part = statement[statement.find("VALUES") + 6:].strip().strip(";")
+                  rows = values_part.split("),(")
                   for row in rows:
                       row = row.replace("(", "").replace(")", "")
                       parts = [p.strip().strip("'") for p in row.split(",")]
                       if len(parts) >= 4:
-                          # parts[1]是号码, parts[2]是省, parts[3]是市
-                          data.append({
-                              'phone': '86' + parts[1],
-                              'province': parts[2],
+                          # 加上 86 前缀
+                          raw_data.append({
+                              'phone': '86' + parts[1], 
+                              'province': parts[2], 
                               'city': parts[3]
                           })
-              return data
-
-          # === 2. 优化函数 (单轮合并) ===
-          def optimize_round(items):
-              processed_indices = set()
-              result = []
               
-              # 按归属地分组，确保只有同地点的号段才合并
-              loc_groups = defaultdict(list)
-              for i, item in enumerate(items):
-                  loc_groups[f"{item['province']}{item['city']}"].append((i, item))
+              # 转为 DataFrame 方便处理
+              current_df = pd.DataFrame(raw_data)
+              print(f"   Initial Records: {len(current_df)}")
 
-              for loc, group in loc_groups.items():
-                  # 在同归属地内按前缀分组
-                  prefix_map = defaultdict(list)
-                  for idx, item in group:
-                      prefix = item['phone'][:-1]
-                      prefix_map[prefix].append((idx, item))
-                  
-                  for prefix, sub_group in prefix_map.items():
-                      # 必须凑齐 0-9 共10个
-                      if len(sub_group) == 10:
-                          # 校验末尾是否是 0,1,2...9
-                          suffixes = sorted([x[1]['phone'][-1] for x in sub_group])
-                          if "".join(suffixes) == "0123456789":
-                              first_item = sub_group[0][1]
-                              result.append({
-                                  'phone': prefix,
-                                  'province': first_item['province'],
-                                  'city': first_item['city']
-                              })
-                              for idx, _ in sub_group:
-                                  processed_indices.add(idx)
+              # --- Step 2: 执行两轮优化 (9位->8位->7位) ---
+              # Round 1
+              print("3. Running Optimization Round 1...")
+              round1_list = process_optimization_round(current_df)
+              round1_df = pd.DataFrame(round1_list)
+              print(f"   Round 1 Result: {len(round1_df)} records (Reduced by {len(current_df) - len(round1_df)})")
 
-              # 没被合并的保留
-              for i, item in enumerate(items):
-                  if i not in processed_indices:
-                      result.append(item)
-              return result
+              # Round 2
+              print("4. Running Optimization Round 2...")
+              round2_list = process_optimization_round(round1_df)
+              final_mobile_data = sorted(round2_list, key=lambda x: int(x['phone']))
+              print(f"   Round 2 Result: {len(final_mobile_data)} records (Reduced by {len(round1_df) - len(final_mobile_data)})")
 
-          # === 3. 拼音转换 ===
-          def to_pinyin(province, city):
-              p = ''.join(lazy_pinyin(province, style=Style.NORMAL))
-              c = ''.join(lazy_pinyin(city, style=Style.NORMAL))
-              return f"{c.title()}, {p.title()}"
+              # --- Step 3: 获取固话数据 ---
+              print("5. Fetching Fixed Lines...")
+              fixed_zh = fetch_fixed_lines(FIXED_ZH_URL)
+              fixed_en = fetch_fixed_lines(FIXED_EN_URL)
 
-          # === 主逻辑 ===
-          def main():
-              os.makedirs('lib/cn', exist_ok=True)
-              
-              # 获取原始数据
-              current_data = get_raw_data()
-              print(f"Initial: {len(current_data)} records.")
+              # --- Step 4: 生成 Dart 文件 ---
+              print("6. Writing Dart files...")
+              os.makedirs(os.path.dirname(OUTPUT_ZH), exist_ok=True)
 
-              # 循环优化直到无法再压缩
-              round_num = 0
-              while True:
-                  round_num += 1
-                  new_data = optimize_round(current_data)
-                  if len(new_data) == len(current_data):
-                      break
-                  print(f"Round {round_num}: {len(current_data)} -> {len(new_data)}")
-                  current_data = new_data
-
-              # 排序
-              current_data.sort(key=lambda x: int(x['phone']))
-
-              # 写入 ZH 文件
-              with open('lib/cn/phone_location_zh_optimized.dart', 'w', encoding='utf-8') as f:
-                  f.write('// Generated by GitHub Actions\nMap<int, String> get86_zh_optimized() {\n  return {\n')
-                  for item in current_data:
-                      # 修正：Value 只有省市
+              # 写入中文版
+              with open(OUTPUT_ZH, 'w', encoding='utf-8') as f:
+                  f.write('// Generated by GitHub Actions (Optimized 2-Rounds)\n')
+                  f.write('Map<int, String> get86_zh() {\n  return {\n')
+                  # 写入固话
+                  for line in fixed_zh:
+                      f.write(f"    {line},\n")
+                  # 写入优化后的手机
+                  for item in final_mobile_data:
+                      # 格式: Key: "Value",
                       f.write(f'    {item["phone"]}: "{item["province"]}{item["city"]}",\n')
                   f.write('  };\n}\n')
 
-              # 写入 EN 文件
-              with open('lib/cn/phone_location_en_optimized.dart', 'w', encoding='utf-8') as f:
-                  f.write('// Generated by GitHub Actions\nMap<int, String> get86_en_optimized() {\n  return {\n')
-                  for item in current_data:
-                      en_val = to_pinyin(item['province'], item['city'])
-                      f.write(f'    {item["phone"]}: "{en_val}",\n')
+              # 写入英文版
+              with open(OUTPUT_EN, 'w', encoding='utf-8') as f:
+                  f.write('// Generated by GitHub Actions (Optimized 2-Rounds)\n')
+                  f.write('Map<int, String> get86_en() {\n  return {\n')
+                  # 写入固话
+                  for line in fixed_en:
+                      f.write(f"    {line},\n")
+                  # 写入优化后的手机
+                  for item in final_mobile_data:
+                      pinyin = convert_to_pinyin(item['province'], item['city'])
+                      f.write(f'    {item["phone"]}: "{pinyin}",\n')
                   f.write('  };\n}\n')
+
+              print("Done! Files generated.")
 
           if __name__ == "__main__":
               main()
           EOF
-          python run_all.py
+          
+          python generate_final.py
 
       - name: Commit and Push
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update Optimized Dart Phone Location Maps"
-          file_pattern: "lib/cn/*.dart"
-          branch: dartnumber
+          commit_message: "chore: Update optimized phone location maps (2-Rounds)"
+          file_pattern: "lib/generated/metadata/geocoding/86_*.dart"
+          branch: main
           repository: .
-          token: ${{ secrets.YOUR_GITHUB_TOKEN }}
+          push_options: '--force'
