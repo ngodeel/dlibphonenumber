@@ -1,36 +1,37 @@
-name: 生成最终版归属地数据 (修复Token问题)
+name: 自动优化并合并固话 (运行在 dlib)
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
-  schedule:
-    - cron: '0 12 1 * *'
 
 permissions:
   contents: write
 
 jobs:
-  generate-final-data:
+  optimize-and-merge:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3  # 回退到 v3，和你之前的代码保持一致
+      - name: Checkout current repo
+        uses: actions/checkout@v4
         with:
-          ref: main                # 确保这里是你要操作的分支
-          token: ${{ secrets.YOUR_GITHUB_TOKEN }} # 【关键修复】显式加上 Token
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas pypinyin
+      - name: Install dependencies
+        run: pip install requests pandas pypinyin
 
-      - name: Run Optimization and Generation Script
+      # =========================================================
+      # 核心脚本：已修复转换逻辑（递归优化 + 标准Dart格式）
+      # =========================================================
+      - name: Process Data
         run: |
-          cat > generate_final.py << 'EOF'
+          cat > run_process.py << 'EOF'
           import requests
           import pandas as pd
           import os
@@ -38,23 +39,24 @@ jobs:
           from collections import defaultdict
           from pypinyin import lazy_pinyin, Style
 
-          # ================= 配置区域 =================
+          # === 配置部分 ===
           SQL_URL = "https://github.com/dannyhu926/phone_location/raw/refs/heads/master/mysql/phone_location.sql"
           FIXED_ZH_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_zh.dart"
           FIXED_EN_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_en.dart"
 
           OUTPUT_ZH = "lib/generated/metadata/geocoding/86_zh.dart"
           OUTPUT_EN = "lib/generated/metadata/geocoding/86_en.dart"
-          # ===========================================
 
+          # === 辅助函数 ===
           def convert_to_pinyin(province, city):
               p = ''.join(lazy_pinyin(province if province else "", style=Style.NORMAL))
               c = ''.join(lazy_pinyin(city if city else "", style=Style.NORMAL))
               if not city: return p.title()
               return f"{c.title()}, {p.title()}"
 
-          def fetch_fixed_lines(url):
-              print(f"Fetching fixed lines from {url}...")
+          def fetch_remote_lines(url):
+              """下载并提取Map内容，确保每行格式正确且无末尾逗号(以便统一处理)"""
+              print(f"Fetching {url}...")
               try:
                   resp = requests.get(url)
                   resp.raise_for_status()
@@ -68,57 +70,41 @@ jobs:
                               lines.append(clean)
                   return lines
               except Exception as e:
-                  print(f"Error fetching fixed lines: {e}")
+                  print(f"Error fetching {url}: {e}")
                   return []
 
-          def process_optimization_round(df):
-              processed_phones = set()
-              result = []
-              # 1. 按 (省+市) 分组
-              location_groups = defaultdict(list)
-              for _, row in df.iterrows():
-                  phone_str = str(row['phone'])
-                  key = f"{row['province']}|{row['city']}"
-                  location_groups[key].append({
-                      'phone': phone_str,
-                      'province': row['province'],
-                      'city': row['city']
-                  })
-
-              # 2. 组内按前缀合并
-              for key, items in location_groups.items():
-                  prefix_groups = defaultdict(list)
-                  for item in items:
-                      if item['phone'] not in processed_phones:
-                          parent_prefix = item['phone'][:-1]
-                          prefix_groups[parent_prefix].append(item)
-
-                  for prefix, group in prefix_groups.items():
-                      if len(group) == 10:
-                          sorted_group = sorted(group, key=lambda x: x['phone'])
-                          if all(int(n['phone'][-1]) == i for i, n in enumerate(sorted_group)):
-                              first = sorted_group[0]
-                              result.append({
-                                  'phone': prefix,
-                                  'province': first['province'],
-                                  'city': first['city']
-                              })
-                              for n in sorted_group:
-                                  processed_phones.add(n['phone'])
+          def optimize_one_round(data_list):
+              """单轮优化逻辑：同归属地下，凑齐0-9则合并"""
+              optimized_result = []
+              # 1. 按 (省, 市) 分组
+              loc_groups = defaultdict(list)
+              for item in data_list:
+                  loc_groups[(item['province'], item['city'])].append(item)
               
-              # 3. 处理未合并的
-              for _, row in df.iterrows():
-                  phone_str = str(row['phone'])
-                  if phone_str not in processed_phones:
-                      result.append({
-                          'phone': phone_str,
-                          'province': row['province'],
-                          'city': row['city']
-                      })
-              return result
+              # 2. 组内尝试合并
+              for (prov, city), items in loc_groups.items():
+                  parent_groups = defaultdict(list)
+                  for item in items:
+                      phone_str = str(item['phone'])
+                      parent = phone_str[:-1] # 父级前缀
+                      parent_groups[parent].append(item)
+                  
+                  for parent, siblings in parent_groups.items():
+                      if len(siblings) == 10:
+                          # 凑齐10个，合并为短号
+                          optimized_result.append({
+                              'phone': parent,
+                              'province': prov,
+                              'city': city
+                          })
+                      else:
+                          # 没凑齐，保留原样
+                          optimized_result.extend(siblings)
+              return optimized_result
 
           def main():
-              print("1. Downloading SQL...")
+              # --- 第一步：解析 SQL ---
+              print("1. Parsing SQL...")
               response = requests.get(SQL_URL)
               response.raise_for_status()
               
@@ -137,60 +123,76 @@ jobs:
                               'city': parts[3]
                           })
               
-              current_df = pd.DataFrame(raw_data)
+              # --- 第二步：循环递归优化 (关键修改) ---
+              print(f"2. Optimizing {len(raw_data)} records...")
+              current_data = raw_data
+              round_num = 0
+              while True:
+                  round_num += 1
+                  new_data = optimize_one_round(current_data)
+                  diff = len(current_data) - len(new_data)
+                  print(f"   Round {round_num}: Reduced by {diff}")
+                  # 如果这一轮没有减少任何数据，说明优化到底了，退出循环
+                  if len(new_data) == len(current_data):
+                      break
+                  current_data = new_data
               
-              # Round 1
-              print("2. Optimizing Round 1...")
-              round1_list = process_optimization_round(current_df)
-              round1_df = pd.DataFrame(round1_list)
-              print(f"   Reduced: {len(current_df)} -> {len(round1_df)}")
+              final_data = sorted(current_data, key=lambda x: int(x['phone']))
+              print(f"   Final count: {len(final_data)}")
 
-              # Round 2
-              print("3. Optimizing Round 2...")
-              round2_list = process_optimization_round(round1_df)
-              final_mobile_data = sorted(round2_list, key=lambda x: int(x['phone']))
-              print(f"   Reduced: {len(round1_df)} -> {len(final_mobile_data)}")
+              # --- 第三步：获取固话 ---
+              print("3. Fetching Fixed Line Data...")
+              fixed_zh_lines = fetch_remote_lines(FIXED_ZH_URL)
+              fixed_en_lines = fetch_remote_lines(FIXED_EN_URL)
 
-              # Fetch Fixed Lines
-              print("4. Fetching Fixed Lines...")
-              fixed_zh = fetch_fixed_lines(FIXED_ZH_URL)
-              fixed_en = fetch_fixed_lines(FIXED_EN_URL)
-
-              # Write Files
-              print("5. Writing Files...")
+              # --- 第四步：写入文件 (修复格式：Key: "Value",) ---
+              print("4. Writing Final Files...")
               os.makedirs(os.path.dirname(OUTPUT_ZH), exist_ok=True)
 
+              # === 写入中文版 ===
               with open(OUTPUT_ZH, 'w', encoding='utf-8') as f:
                   f.write('// Generated by GitHub Actions\n')
                   f.write('Map<int, String> get86_zh() {\n  return {\n')
-                  for line in fixed_zh:
+                  
+                  # 写入固话
+                  for line in fixed_zh_lines:
                       f.write(f"    {line},\n")
-                  for item in final_mobile_data:
-                      f.write(f'    {item["phone"]}: "{item["province"]}{item["city"]}",\n')
+                  
+                  # 写入手机 (Key是数字，Value是字符串，末尾必须有逗号)
+                  for row in final_data:
+                      f.write(f'    {row["phone"]}: "{row["province"]}{row["city"]}",\n')
+                      
                   f.write('  };\n}\n')
 
+              # === 写入英文版 ===
               with open(OUTPUT_EN, 'w', encoding='utf-8') as f:
                   f.write('// Generated by GitHub Actions\n')
                   f.write('Map<int, String> get86_en() {\n  return {\n')
-                  for line in fixed_en:
+                  
+                  # 写入固话
+                  for line in fixed_en_lines:
                       f.write(f"    {line},\n")
-                  for item in final_mobile_data:
-                      pinyin = convert_to_pinyin(item['province'], item['city'])
-                      f.write(f'    {item["phone"]}: "{pinyin}",\n')
+                  
+                  # 写入手机
+                  for row in final_data:
+                      pinyin = convert_to_pinyin(row['province'], row['city'])
+                      f.write(f'    {row["phone"]}: "{pinyin}",\n')
+                      
                   f.write('  };\n}\n')
-
+                  
               print("Done.")
 
           if __name__ == "__main__":
               main()
           EOF
-          python generate_final.py
+          
+          python run_process.py
 
-      - name: Commit and Push
+      - name: Commit and Force Push
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: Update optimized phone location maps"
+          commit_message: "chore(data): Auto optimize and merge fixed line data"
           file_pattern: "lib/generated/metadata/geocoding/86_*.dart"
           branch: main
           repository: .
-          token: ${{ secrets.YOUR_GITHUB_TOKEN }} # 【关键修复】这里必须加上 Token
+          push_options: '--force'
