@@ -1,0 +1,202 @@
+name: 自动优化并合并固话 (修复格式版)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  optimize-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests pandas pypinyin
+
+      - name: Process Data
+        run: |
+          cat > run_process.py << 'EOF'
+          import requests
+          import pandas as pd
+          import os
+          import re
+          from collections import defaultdict
+          from pypinyin import lazy_pinyin, Style
+
+          # === 配置 ===
+          SQL_URL = "https://github.com/dannyhu926/phone_location/raw/refs/heads/master/mysql/phone_location.sql"
+          # 固话数据源 (Dart文件)
+          FIXED_ZH_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_zh.dart"
+          FIXED_EN_URL = "https://raw.githubusercontent.com/haygcao/vccard/dartnumber/lib/merged/fixed_line_en.dart"
+          
+          OUTPUT_ZH = "lib/generated/metadata/geocoding/86_zh.dart"
+          OUTPUT_EN = "lib/generated/metadata/geocoding/86_en.dart"
+
+          # === 辅助函数 ===
+          def convert_to_pinyin(province, city):
+              # 处理空值
+              province = province if province else ""
+              city = city if city else ""
+              p = ''.join(lazy_pinyin(province, style=Style.NORMAL))
+              c = ''.join(lazy_pinyin(city, style=Style.NORMAL))
+              if not city: return p.title()
+              return f"{c.title()}, {p.title()}"
+
+          def fetch_remote_lines(url):
+              """下载并提取 Map 内容，确保每行格式正确"""
+              print(f"Fetching {url}...")
+              try:
+                  resp = requests.get(url)
+                  resp.raise_for_status()
+                  content = resp.text
+                  match = re.search(r'return\s*\{([\s\S]*?)\};', content)
+                  if match:
+                      raw_body = match.group(1).strip()
+                      lines = []
+                      for line in raw_body.split('\n'):
+                          clean_line = line.strip()
+                          if clean_line:
+                              # 确保这一行是 Key: Value 格式，且移除可能存在的末尾逗号以便重新统一添加
+                              if clean_line.endswith(','):
+                                  clean_line = clean_line[:-1]
+                              lines.append(clean_line)
+                      return lines
+                  return []
+              except Exception as e:
+                  print(f"Error fetching {url}: {e}")
+                  return []
+
+          def optimize_one_round(data_list):
+              """单轮优化逻辑"""
+              optimized_result = []
+              # 1. 按 (省, 市) 分组
+              loc_groups = defaultdict(list)
+              for item in data_list:
+                  loc_groups[(item['province'], item['city'])].append(item)
+              
+              # 2. 组内尝试合并
+              for (prov, city), items in loc_groups.items():
+                  parent_groups = defaultdict(list)
+                  for item in items:
+                      phone_str = str(item['phone'])
+                      parent = phone_str[:-1] # 父级前缀
+                      parent_groups[parent].append(item)
+                  
+                  for parent, siblings in parent_groups.items():
+                      # 必须凑齐 0-9 也就是10个才能合并
+                      if len(siblings) == 10:
+                          optimized_result.append({
+                              'phone': parent, # 使用短号码
+                              'province': prov,
+                              'city': city
+                          })
+                      else:
+                          # 否则保留原始长号码
+                          optimized_result.extend(siblings)
+                          
+              return optimized_result
+
+          def main():
+              # 1. 解析 SQL
+              print("1. Parsing SQL...")
+              response = requests.get(SQL_URL)
+              response.raise_for_status()
+              
+              insert_statements = [line for line in response.text.splitlines() if line.startswith("INSERT INTO `phone_location`")]
+              raw_data = []
+              for statement in insert_statements:
+                  values_part = statement[statement.find("VALUES") + 6:].strip().strip(";")
+                  # 分割 SQL value 组
+                  rows = values_part.split("),(")
+                  for row in rows:
+                      row = row.replace("(", "").replace(")", "")
+                      # SQL 格式通常是: id, phone, province, city, isp, zip, code
+                      parts = [p.strip().strip("'") for p in row.split(",")]
+                      if len(parts) >= 4:
+                          raw_data.append({
+                              'phone': '86' + parts[1], 
+                              'province': parts[2], 
+                              'city': parts[3]
+                          })
+
+              # 2. 循环优化
+              print(f"2. Optimizing {len(raw_data)} records...")
+              current_data = raw_data
+              round_num = 0
+              while True:
+                  round_num += 1
+                  new_data = optimize_one_round(current_data)
+                  diff = len(current_data) - len(new_data)
+                  print(f"   Round {round_num}: Reduced by {diff}")
+                  if len(new_data) == len(current_data):
+                      break
+                  current_data = new_data
+              
+              final_data = sorted(current_data, key=lambda x: int(x['phone']))
+
+              # 3. 准备写入
+              print("3. Writing files...")
+              fixed_zh = fetch_remote_lines(FIXED_ZH_URL)
+              fixed_en = fetch_remote_lines(FIXED_EN_URL)
+              
+              os.makedirs(os.path.dirname(OUTPUT_ZH), exist_ok=True)
+
+              # === 写入中文 (ZH) ===
+              with open(OUTPUT_ZH, 'w', encoding='utf-8') as f:
+                  f.write('// Generated by GitHub Actions\n')
+                  f.write('Map<int, String> get86_zh() {\n  return {\n')
+                  
+                  # 写入固话 (自带格式，补上逗号和缩进)
+                  for line in fixed_zh:
+                      f.write(f"    {line},\n")
+                  
+                  # 写入手机 (构造格式: Key: "Value",)
+                  for row in final_data:
+                      # 修正点：Key是数字，Value是字符串，末尾加逗号
+                      f.write(f'    {row["phone"]}: "{row["province"]}{row["city"]}",\n')
+                      
+                  f.write('  };\n}\n')
+
+              # === 写入英文 (EN) ===
+              with open(OUTPUT_EN, 'w', encoding='utf-8') as f:
+                  f.write('// Generated by GitHub Actions\n')
+                  f.write('Map<int, String> get86_en() {\n  return {\n')
+                  
+                  for line in fixed_en:
+                      f.write(f"    {line},\n")
+                  
+                  for row in final_data:
+                      pinyin = convert_to_pinyin(row['province'], row['city'])
+                      f.write(f'    {row["phone"]}: "{pinyin}",\n')
+                      
+                  f.write('  };\n}\n')
+
+              print("Done.")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          
+          python run_process.py
+
+      - name: Commit and Force Push
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(data): Update map with correct format and optimized ranges"
+          file_pattern: "lib/generated/metadata/geocoding/86_*.dart"
+          branch: main
+          repository: .
+          push_options: '--force'
