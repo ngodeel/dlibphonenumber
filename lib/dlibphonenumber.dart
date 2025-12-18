@@ -21,3 +21,10 @@ export 'phone_number_to_time_zones_mapper.dart';
 export 'phone_number_offline_geocoder.dart';
 export 'locale.dart';
 export 'phone_number_to_carrier_mapper.dart';
+
+import 'generated/metadata/geocoding_loader.dart';
+export 'generated/metadata/geocoding_loader.dart';
+
+Future<void> dlibphonenumberInit() async {
+  await GeocodingLoader.loadAll();
+}
